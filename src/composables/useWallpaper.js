@@ -1,5 +1,13 @@
 ﻿import { ref } from 'vue'
 import { STORAGE_KEYS } from '../config/storageKeys'
+import {
+  cacheWallpaperResponse,
+  ensureWallpaperConnections,
+  ensureWallpaperPreload,
+  getWallpaperUrl,
+  readCachedWallpaperObjectUrl,
+  revokeWallpaperObjectUrl
+} from '../utils/wallpaper'
 
 const LEGACY_WALLPAPER_STORAGE_KEY = 'isWallpaper'
 const COLOR_WHITE = '#fff'
@@ -37,18 +45,13 @@ function applyPopupTheme(theme) {
   root.setAttribute('data-popup-theme', theme)
 }
 
-function isMobileDevice() {
-  if (typeof window === 'undefined') return false
-
-  return window.matchMedia('(max-width: 768px)').matches
-}
-
 export function useWallpaper() {
   const wallpaperMode = ref('bing')
   const textColor = ref(COLOR_WHITE)
   const logoColor = textColor
   const poemColor = textColor
   const popupTheme = ref('light')
+  let activeWallpaperObjectUrl = ''
 
   function persistTextColor(color) {
     localStorage.setItem(STORAGE_KEYS.LOGO_COLOR, color)
@@ -96,61 +99,111 @@ export function useWallpaper() {
     applyPopupTheme(popupTheme.value)
   }
 
-  async function qhImg(fileID) {
-    try {
-      const response = await fetch(`/style/json/${fileID}.txt`, { cache: 'no-store' })
-      const text = await response.text()
-      const lines = text.split(/\r?\n/).filter(Boolean)
-      if (lines.length === 0) return ''
-      const random = lines[Math.floor(Math.random() * Math.min(lines.length, 500))]
-      return `https://p${fileID}.qhimg.com/${random}`
-    } catch {
-      return ''
+  // async function qhImg(fileID) {
+  //   try {
+  //     const response = await fetch(`/style/json/${fileID}.txt`, { cache: 'no-store' })
+  //     const text = await response.text()
+  //     const lines = text.split(/\r?\n/).filter(Boolean)
+  //     if (lines.length === 0) return ''
+  //     const random = lines[Math.floor(Math.random() * Math.min(lines.length, 500))]
+  //     return `https://p${fileID}.qhimg.com/${random}`
+  //   } catch {
+  //     return ''
+  //   }
+  // }
+
+  // async function loliconImg() {
+  //   try {
+  //     const response = await fetch('https://api.lolicon.app/setu/v2', { cache: 'no-store' })
+  //     const data = await response.json()
+  //     const urls = data?.data?.[0]?.urls
+  //     return urls?.original || urls?.regular || urls?.small || ''
+  //   } catch {
+  //     return ''
+  //   }
+  // }
+
+  function applyWallpaperImage(url) {
+    const body = document.body
+    if (!body) return
+
+    if (activeWallpaperObjectUrl && activeWallpaperObjectUrl !== url) {
+      revokeWallpaperObjectUrl(activeWallpaperObjectUrl)
+      activeWallpaperObjectUrl = ''
     }
+
+    if (typeof url === 'string' && url.startsWith('blob:')) {
+      activeWallpaperObjectUrl = url
+    }
+
+    body.style.backgroundImage = `url(${url})`
   }
 
-  async function loliconImg() {
-    try {
-      const response = await fetch('https://api.lolicon.app/setu/v2', { cache: 'no-store' })
-      const data = await response.json()
-      const urls = data?.data?.[0]?.urls
-      return urls?.original || urls?.regular || urls?.small || ''
-    } catch {
-      return ''
+  async function fetchFreshWallpaperObjectUrl(url) {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      mode: 'cors'
+    })
+
+    if (!response.ok) {
+      throw new Error(`wallpaper_fetch_${response.status}`)
     }
+
+    const blob = await response.blob()
+    if (!blob.type.startsWith('image/')) {
+      throw new Error('wallpaper_blob_invalid')
+    }
+
+    await cacheWallpaperResponse(url, new Response(blob, { headers: { 'Content-Type': blob.type } }))
+    return URL.createObjectURL(blob)
+  }
+
+  function refreshWallpaperCache(url, mode) {
+    ;(async () => {
+      try {
+        const freshWallpaperObjectUrl = await fetchFreshWallpaperObjectUrl(url)
+        if (wallpaperMode.value === mode) {
+          applyWallpaperImage(freshWallpaperObjectUrl)
+        } else {
+          revokeWallpaperObjectUrl(freshWallpaperObjectUrl)
+        }
+      } catch {
+        // Ignore background refresh errors to avoid affecting first paint.
+      }
+    })()
   }
 
   async function applyWallpaper(mode) {
     const body = document.body
     if (!body) return
-    const isMobile = isMobileDevice()
+    ensureWallpaperConnections()
 
-    switch (mode) {
-      case 'bing': {
-        // const bingUrl = 'https://api.dujin.org/bing/1920.php'
-        const bingUrl = isMobile ? 'https://bing.img.run/m.php' : 'https://bing.img.run/uhd.php'
-        body.style.backgroundImage = `url(${bingUrl})`
-        break
+    const wallpaperUrl = getWallpaperUrl(mode)
+    if (!wallpaperUrl) {
+      if (activeWallpaperObjectUrl) {
+        revokeWallpaperObjectUrl(activeWallpaperObjectUrl)
+        activeWallpaperObjectUrl = ''
       }
-      case 'random': {
-        // const url = await loliconImg()
-        // if (url) {
-        //   body.style.backgroundImage = `url(${url})`
-        // } else {
-        //   const fallback = await qhImg(Math.floor(Math.random() * 20))
-        //   body.style.backgroundImage = fallback ? `url(${fallback})` : ''
-        // }
-        const randomUrl = isMobile ? 'https://bing.img.run/rand_m.php' : 'https://bing.img.run/rand_uhd.php'
-        body.style.backgroundImage = `url(${randomUrl})`
-        break
-      }
-      case 'none':
-        body.style.removeProperty('background-image')
-        break
-      default:
-        body.style.backgroundImage = `url(${mode})`
-        break
+      body.style.removeProperty('background-image')
+      return
     }
+
+    const cachedWallpaperUrl = await readCachedWallpaperObjectUrl(wallpaperUrl)
+    if (cachedWallpaperUrl) {
+      applyWallpaperImage(cachedWallpaperUrl)
+      refreshWallpaperCache(wallpaperUrl, mode)
+      return
+    }
+
+    ensureWallpaperPreload(wallpaperUrl)
+    applyWallpaperImage(wallpaperUrl)
+
+    // Fill cache after first paint, but don't compete with the visible request immediately.
+    window.setTimeout(() => {
+      if (wallpaperMode.value === mode) {
+        refreshWallpaperCache(wallpaperUrl, mode)
+      }
+    }, 1200)
   }
 
   async function setWallpaper(mode) {
